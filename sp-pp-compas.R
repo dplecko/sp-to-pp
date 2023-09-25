@@ -8,6 +8,15 @@ library(latex2exp)
 library(data.table)
 
 # helpers
+ts_boot <- function(x, y) {
+  
+  nrep <- 10000
+  x_t <- rnorm(nrep, mean = mean(x), sd = sd(x))
+  y_t <- rnorm(nrep, mean = mean(y), sd = sd(y))
+
+  min(mean(x_t < y_t), 1 - mean(x_t < y_t))
+}
+
 compute_ippm <- function(pred, out, x, x0, name, nboot = 100) {
 
   breaks <- quantile(pred, probs = seq(0.1, 0.9, 0.1))
@@ -36,6 +45,22 @@ compute_ippm <- function(pred, out, x, x0, name, nboot = 100) {
 
   data.frame(value = mean(ippm), sd = sd(ippm), measure = "ippm",
              outcome = name)
+}
+
+compute_roc <- function(probs, labs, nboot = 100) {
+  
+  aucs <- vapply(
+    seq_len(nboot),
+    function(i) {
+      
+      bts <- sample.int(length(probs), replace = TRUE)
+      auc <- PRROC::roc.curve(scores.class0 = probs[bts], 
+                              weights.class0 = labs[bts])$auc
+      ifelse(auc >= 0.5, auc, 1 - auc)
+    }, numeric(1L)
+  )
+  
+  c(mean(aucs), sd(aucs))
 }
 
 compute_tv <- function(out, x, x0, name, nboot = 100) {
@@ -141,13 +166,65 @@ fairadapt_tvd <- fairness_cookbook(
   x0 = "Majority", x1 = "Minority", nboot1 = 5
 )
 
+# add SP and PP predictors
+
+# fit an unconstrained predictor using random forest
+rf <- ranger(two_year_recid ~ ., data = data[, vars],
+             probability = TRUE)
+
+p_oob <- rf$predictions[, 2]
+
+# SP predictor
+th_min <- quantile(p_oob[data$race == "Minority"], 
+                   probs = 1 - mean(data$northpointe))
+th_maj <- quantile(p_oob[data$race == "Majority"], 
+                   probs = 1 - mean(data$northpointe))
+y_sp <- ifelse(data$race == "Minority", p_oob > th_min, p_oob > th_maj)
+data$y_sp <- as.integer(y_sp)
+
+sp_tvd <- fairness_cookbook(
+  data, X = X, W = W, Z = Z, Y = "y_sp",
+  x0 = "Majority", x1 = "Minority", nboot1 = 5
+)
+sp_ippm <- compute_ippm(data$y_sp, data$two_year_recid, data$race,
+                        "Majority", "SP")
+
+# PP predictor
+th <- quantile(p_oob, probs = 1 - mean(data$northpointe))
+data$y_pp <- as.integer(p_oob > th)
+
+pp_tvd <- fairness_cookbook(
+  data, X = X, W = W, Z = Z, Y = "y_pp",
+  x0 = "Majority", x1 = "Minority", nboot1 = 5
+)
+pp_ippm <- compute_ippm(data$y_pp, data$two_year_recid, data$race,
+                        "Majority", "PP")
+
+# hypothesis testing for differences
+
+# NP vs. true
+ts_boot(
+  subset(two_year$measures, measure == "ctfse")$value,
+  subset(northpointe$measures, measure == "ctfse")$value
+)
+
+# FP vs. true
+ts_boot(
+  subset(two_year$measures, measure == "ctfse")$value,
+  subset(fairadapt_tvd$measures, measure == "ctfse")$value
+)
+
 # side-by-side plot of three decompositions
 res <- rbind(
   cbind(summary(two_year)$measures, outcome = "true"),
   cbind(summary(northpointe)$measures, outcome = "northpointe"),
   cbind(summary(fairadapt_tvd)$measures, outcome = "fairadapt"),
+  cbind(summary(sp_tvd)$measures, outcome = "SP"),
+  cbind(summary(pp_tvd)$measures, outcome = "PP"),
   np_ippm,
-  fp_ippm
+  fp_ippm,
+  sp_ippm,
+  pp_ippm
 )
 
 
@@ -157,14 +234,21 @@ ggplot(
   res,
   aes(x = factor(measure, levels = c("ctfde", "ctfie", "ctfse", "tv", "ippm")),
       y = value,
-      fill = factor(outcome, levels = c("true", "northpointe", "fairadapt")))
+      fill = factor(
+        outcome, 
+        levels = c("true", "northpointe", "fairadapt", "SP", "PP")
+      )
+     )
   ) +
   geom_bar(position=position_dodge(), stat="identity", colour='black') +
   geom_errorbar(aes(ymin = value - 1.96 * sd, ymax = value + 1.96 * sd),
                 width=.2, position=position_dodge(.9)) +
-  scale_fill_discrete(name = "Outcome",
-                      labels = c(TeX("$Y^{true}$"), TeX("$\\hat{Y}^{NP}$"),
-                                 TeX("$\\hat{Y}^{FP}$"))) +
+  scale_fill_discrete(
+    name = "Outcome",
+    labels = c(TeX("$Y^{true}$"), TeX("$\\hat{Y}^{NP}$"),
+               TeX("$\\hat{Y}^{FP}$"), TeX("$\\hat{Y}^{SP}$"),
+               TeX("$\\hat{Y}^{PP}$"))
+  ) +
   theme_bw() +
   theme(
     legend.position = "bottom",
@@ -178,11 +262,11 @@ ggplot(
   scale_x_discrete(labels = c(TeX("Ctf-DE"),
                               TeX("Ctf-IE"),
                               TeX("Ctf-SE"),
-                              TeX("TV"),
+                              TeX("SPM"),
                               TeX("iPPM"))) +
   scale_y_continuous(labels = scales::percent) # +
   # ggtitle("Fairness Measures on the COMPAS dataset")
-ggsave("compas-algorithm-1.png", width = 6, height = 4)
+ggsave("compas-algorithm-1-revised.png", width = 7, height = 4)
 
 
 # Pareto plots
@@ -215,6 +299,10 @@ for (seed in seq_len(nrep)) {
                             data$race, "Majority", names(cases)[i])
     fp_ippm$seed <- seed
     
+    auc_vals <- compute_roc(adapt_oob_prob, data$two_year_recid)
+    fp_auc <- data.frame(value = auc_vals[1], sd = auc_vals[2], measure = "auc", 
+                         outcome = names(cases)[i], seed = seed)
+    
     # match the prevalence with NP and true
     adapt_rf_class <- ranger(two_year_recid ~ ., ad_dat,
                              classification = TRUE)
@@ -223,7 +311,7 @@ for (seed in seq_len(nrep)) {
     fp_tv <- compute_tv(adapt_oob, data$race, "Minority", names(cases)[i])
     fp_tv$seed <- seed
     
-    res <- rbind(res, fp_tv, fp_ippm)
+    res <- rbind(res, fp_tv, fp_ippm, fp_auc)
   }
 }
 
@@ -235,19 +323,23 @@ combine_musd <- function(mus, sds) {
 
 res <- as.data.table(res)
 res <- res[, combine_musd(value, sd), by = c("measure", "outcome")]
-pareto <- merge(res[res$measure == "tv", ], res[res$measure == "ippm", ],
-                by = "outcome")
-ggplot(pareto, aes(x = value.x, y = value.y, label = outcome, color = outcome)) +
-  geom_errorbar(aes(ymin = value.y - sd.y, ymax = value.y + sd.y)) +
-  geom_errorbarh(aes(xmin = value.x - sd.x, xmax = value.x + sd.x)) +
-  geom_point() + theme_bw() + xlab("Total Variation (TV)") +
+
+paretoA <- merge(res[res$measure == "tv", ], res[res$measure == "ippm", ],
+                 by = "outcome")
+pp_vs_sp <- ggplot(paretoA, aes(x = value.x, y = value.y, label = outcome, 
+                                color = outcome)) +
+  geom_errorbar(aes(ymin = value.y - sd.y, ymax = value.y + sd.y),
+                linewidth = 1.5, width = 0.01) +
+  geom_errorbarh(aes(xmin = value.x - sd.x, xmax = value.x + sd.x),
+                 linewidth = 1.5, height = 0.006) +
+  geom_point() + theme_bw() + xlab("Statistical Parity Measure (SPM)") +
   ylab("Integrated PPM") +
   scale_color_discrete(
     name = "BN set",
     labels = c(TeX("$\\oslash$"),
-              TeX("$W$"),
-              TeX("$Z$"),
-              TeX("$\\{ Z, W \\}$")),
+               TeX("$W$"),
+               TeX("$Z$"),
+               TeX("$\\{ Z, W \\}$")),
   ) +
   theme(
     legend.position = "bottom", 
@@ -257,4 +349,47 @@ ggplot(pareto, aes(x = value.x, y = value.y, label = outcome, color = outcome)) 
     legend.title = element_text(size = 16)
   )
 
-ggsave("pareto-plot.png", width = 6 * 1.25, height = 4 * 1.25)
+
+paretoB <- merge(res[res$measure == "tv", ], res[res$measure == "auc", ],
+                 by = "outcome")
+auc_vs_sp <- ggplot(paretoB, aes(x = value.x, y = value.y, label = outcome, 
+                                 color = outcome)) +
+  geom_errorbar(aes(ymin = value.y - sd.y, ymax = value.y + sd.y),
+                linewidth = 1.5, width = 0.01) +
+  geom_errorbarh(aes(xmin = value.x - sd.x, xmax = value.x + sd.x),
+                 linewidth = 1.5, height = 0.0015) +
+  geom_point() + theme_bw() + xlab("Statistical Parity Measure (SPM)") +
+  ylab("Area Under ROC") +
+  scale_color_discrete(
+    name = "BN set",
+    labels = c(TeX("$\\oslash$"),
+               TeX("$W$"),
+               TeX("$Z$"),
+               TeX("$\\{ Z, W \\}$")),
+  ) +
+  theme(
+    legend.position = "bottom", 
+    legend.text = element_text(size = 16),
+    axis.title = element_text(size = 16),
+    axis.text = element_text(size = 12),
+    legend.title = element_text(size = 16)
+  )
+
+# Remove x-axis title and legend from pp_vs_sp
+pp_vs_sp <- pp_vs_sp + theme(axis.title.x = element_blank(), legend.position = "none")
+
+# Remove x-axis title from auc_vs_sp
+auc_vs_sp <- auc_vs_sp + theme(axis.title.x = element_blank())
+
+# Combine plots one below the other
+combined_plot <- cowplot::plot_grid(pp_vs_sp, auc_vs_sp, ncol = 1)
+
+# Create drawing canvas
+final_plot <- cowplot::ggdraw() +
+  cowplot::draw_plot(combined_plot, y = 0.05, height = 0.95) +
+  cowplot::draw_label("Statistical Parity Measure (SPM)", x = 0.53, y = 0.025)
+
+# Display final plot
+final_plot
+
+ggsave("pareto-plot-with-auc.png", width = 5 * 1.6, height = 4 * 1.6)
